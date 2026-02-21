@@ -43,7 +43,7 @@ function monnify_config()
       'Type'         => 'text',
       'Size'         => '80',
       'Default'      => '',
-      'Description'  => 'Se você for usar callback/webhook, valide com este token (ex: header X-Monnify-Webhook-Token).',
+      'Description'  => 'Se você for usar callback/webhook, valide com este token (header X-Monnify-Webhook-Token).',
     ],
 
     'auto_check_status' => [
@@ -56,7 +56,7 @@ function monnify_config()
 }
 
 /**
- * HTTP helper usando cURL (não precisa Guzzle).
+ * HTTP helper usando cURL (sem Guzzle)
  */
 function monnify_http($method, $url, $token, $payload = null)
 {
@@ -92,19 +92,20 @@ function monnify_http($method, $url, $token, $payload = null)
   }
 
   $json = json_decode($body, true);
+
   return [
-    'ok'   => ($code >= 200 && $code < 300),
-    'code' => $code,
-    'raw'  => $body,
-    'json' => is_array($json) ? $json : null,
-    'error'=> null,
+    'ok'    => ($code >= 200 && $code < 300),
+    'code'  => $code,
+    'raw'   => $body,
+    'json'  => is_array($json) ? $json : null,
+    'error' => null,
   ];
 }
 
 function monnify_is_paid_status($status)
 {
-  $s = mb_strtolower(trim((string) $status));
-  $paid = ['paid', 'pago', 'concluida', 'concluída', 'concluido', 'concluído', 'completed', 'concluida'];
+  $s = mb_strtolower(trim((string)$status));
+  $paid = ['paid', 'pago', 'concluida', 'concluída', 'concluido', 'concluído', 'completed'];
   return in_array($s, $paid, true);
 }
 
@@ -113,24 +114,42 @@ function monnify_get_record_by_invoice($invoiceId)
   return Capsule::table('mod_monnify_pix')->where('invoice_id', (int)$invoiceId)->first();
 }
 
+/**
+ * Salva/atualiza registro.
+ * - Se existir coluna "amount", salva nela.
+ * - Se não existir, tenta salvar em amount_cents (compatibilidade), mas com valor em centavos DESATIVADO.
+ */
 function monnify_save_record($invoiceId, $clientId, array $data)
 {
   $now = date('Y-m-d H:i:s');
 
+  // Detecta se a coluna "amount" existe (opcional)
+  $hasAmountCol = false;
+  try {
+    $cols = Capsule::select("SHOW COLUMNS FROM mod_monnify_pix LIKE 'amount'");
+    $hasAmountCol = !empty($cols);
+  } catch (Throwable $e) {
+    $hasAmountCol = false;
+  }
+
   $payload = [
-    'invoice_id'    => (int) $invoiceId,
-    'client_id'     => (int) $clientId,
+    'invoice_id'    => (int)$invoiceId,
+    'client_id'     => (int)$clientId,
     'charge_id'     => $data['charge_id'] ?? null,
     'reference_id'  => $data['reference_id'] ?? null,
     'txid'          => $data['txid'] ?? null,
     'status'        => $data['status'] ?? null,
-    'amount_cents'  => $data['amount_cents'] ?? null,
     'qr_code_url'   => $data['qr_code_url'] ?? null,
     'copia_e_cola'  => $data['copia_e_cola'] ?? null,
     'checkout_url'  => $data['checkout_url'] ?? null,
     'raw_response'  => $data['raw_response'] ?? null,
     'updated_at'    => $now,
   ];
+
+  // Salva amount em reais, se coluna existir
+  if ($hasAmountCol) {
+    $payload['amount'] = $data['amount'] ?? null; // ex: "10.00"
+  }
 
   $exists = Capsule::table('mod_monnify_pix')->where('invoice_id', (int)$invoiceId)->exists();
 
@@ -145,24 +164,25 @@ function monnify_save_record($invoiceId, $clientId, array $data)
 function monnify_create_charge($params)
 {
   $apiUrl = rtrim($params['api_url'], '/');
-  $token  = trim((string) $params['token']);
+  $token  = trim((string)$params['token']);
 
   if (!$token) {
     return ['ok' => false, 'error' => 'Token Bearer não configurado no gateway.'];
   }
 
-  $invoiceId  = (int) $params['invoiceid'];
-  $clientId   = (int) $params['clientdetails']['userid'];
-  $fullName   = (string) $params['clientdetails']['fullname'];
-  $email      = (string) $params['clientdetails']['email'];
-  $phone      = (string) ($params['clientdetails']['phonenumber'] ?? '');
+  $invoiceId = (int)$params['invoiceid'];
+  $clientId  = (int)$params['clientdetails']['userid'];
+  $fullName  = (string)$params['clientdetails']['fullname'];
+  $email     = (string)$params['clientdetails']['email'];
+  $phone     = (string)($params['clientdetails']['phonenumber'] ?? '');
 
-  // WHMCS amount é em reais. Sua API parece usar centavos.
-  $amount_cents = (int) round(((float)$params['amount']) * 100);
+  // ✅ SEM conversão para centavos
+  // WHMCS já vem em reais. Vamos mandar como decimal "10.00"
+  $amount = number_format((float)$params['amount'], 2, '.', '');
 
   $payload = [
     'type'        => 'immediate',
-    'amount'      => $amount_cents,
+    'amount'      => $amount,
     'customer_id' => $clientId,
     'description' => 'Fatura WHMCS #' . $invoiceId,
     'metadata' => [
@@ -171,7 +191,7 @@ function monnify_create_charge($params)
       'phone'      => $phone,
       'invoice_id' => $invoiceId,
       'client_id'  => $clientId,
-    ]
+    ],
   ];
 
   $res = monnify_http('POST', $apiUrl . '/tenant/charges', $token, $payload);
@@ -197,14 +217,14 @@ function monnify_create_charge($params)
   return [
     'ok' => true,
     'data' => [
-      'charge_id'    => (string) $charge_id,
-      'reference_id' => (string) $reference_id,
-      'txid'         => (string) $txid,
-      'status'       => (string) $status,
-      'amount_cents' => $amount_cents,
-      'qr_code_url'  => (string) $qr_code_url,
-      'copia_e_cola' => (string) $copia_e_cola,
-      'checkout_url' => (string) $checkout_url,
+      'charge_id'    => (string)$charge_id,
+      'reference_id' => (string)$reference_id,
+      'txid'         => (string)$txid,
+      'status'       => (string)$status,
+      'amount'       => $amount, // ✅ reais
+      'qr_code_url'  => (string)$qr_code_url,
+      'copia_e_cola' => (string)$copia_e_cola,
+      'checkout_url' => (string)$checkout_url,
       'raw_response' => json_encode($res['json']),
     ],
   ];
@@ -216,43 +236,44 @@ function monnify_check_and_mark_paid($params, $record)
     return $record;
   }
 
-  $token = trim((string) $params['token']);
+  $token = trim((string)$params['token']);
   if (!$token) return $record;
 
   $apiUrl = rtrim($params['api_url'], '/');
 
   $chargeId  = $record->charge_id ?? null;
-  $invoiceId = (int) $params['invoiceid'];
+  $invoiceId = (int)$params['invoiceid'];
 
   if (!$chargeId) return $record;
 
   $res = monnify_http('GET', $apiUrl . '/tenant/charges/' . rawurlencode($chargeId) . '/status', $token);
 
   if (!$res['ok'] || empty($res['json']['success'])) {
-    // não quebra a tela, só retorna
     return $record;
   }
 
-  $data = $res['json']['data'] ?? [];
-  $status = (string) ($data['status'] ?? 'pending');
+  $data   = $res['json']['data'] ?? [];
+  $status = (string)($data['status'] ?? 'pending');
 
   // Atualiza DB
   monnify_save_record($invoiceId, (int)$params['clientdetails']['userid'], [
-    'status' => $status,
+    'status'       => $status,
     'raw_response' => json_encode($res['json']),
   ]);
 
   // Se pago, marca fatura no WHMCS
   if (monnify_is_paid_status($status)) {
-    // evita duplicar: checa se já está paga no WHMCS
     $invoice = Capsule::table('tblinvoices')->where('id', $invoiceId)->first();
+
     if ($invoice && $invoice->status !== 'Paid') {
       $transactionId = $record->txid ?: ($data['reference_id'] ?? ('MONNIFY-' . $chargeId));
-      $paymentAmount = (float) $params['amount'];
+
+      // ✅ valor sempre do WHMCS (reais)
+      $paymentAmount = (float)$params['amount'];
 
       addInvoicePayment(
         $invoiceId,
-        (string) $transactionId,
+        (string)$transactionId,
         $paymentAmount,
         0,
         'monnify'
@@ -262,24 +283,23 @@ function monnify_check_and_mark_paid($params, $record)
     }
   }
 
-  // retorna record atualizado
   return monnify_get_record_by_invoice($invoiceId) ?: $record;
 }
 
 function monnify_link($params)
 {
-  $invoiceId = (int) $params['invoiceid'];
-  $clientId  = (int) $params['clientdetails']['userid'];
+  $invoiceId = (int)$params['invoiceid'];
+  $clientId  = (int)$params['clientdetails']['userid'];
 
-  // 1) Se já existe cobrança salva, usa ela
   $record = monnify_get_record_by_invoice($invoiceId);
 
-  // 2) Senão, cria
   if (!$record) {
     $created = monnify_create_charge($params);
+
     if (empty($created['ok'])) {
       $msg = $created['error'] ?? 'Erro ao gerar Pix.';
       logActivity('Monnify Pix: ' . $msg);
+
       return '<div style="padding:12px;border:1px solid #f3c2c2;background:#fff5f5;border-radius:10px;">
         <strong>Erro ao gerar Pix</strong><br>' . htmlspecialchars($msg) . '
       </div>';
@@ -289,17 +309,14 @@ function monnify_link($params)
     $record = monnify_get_record_by_invoice($invoiceId);
   }
 
-  // 3) Polling (opcional) ao abrir a fatura
   if ($record) {
     $record = monnify_check_and_mark_paid($params, $record);
   }
 
-  // 4) Monta UI
-  $status = $record->status ?? 'pending';
-
-  $qrUrl  = $record->qr_code_url ?? '';
-  $copia  = $record->copia_e_cola ?? '';
-  $txid   = $record->txid ?? '';
+  $status   = $record->status ?? 'pending';
+  $qrUrl    = $record->qr_code_url ?? '';
+  $copia    = $record->copia_e_cola ?? '';
+  $txid     = $record->txid ?? '';
   $checkout = $record->checkout_url ?? '';
 
   $statusLabel = monnify_is_paid_status($status) ? 'PAGO' : 'PENDENTE';
